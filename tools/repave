@@ -12,7 +12,6 @@
 # and the DESTRUCTIVE steps 2-3 (PlanetScale database delete+recreate + fresh role + staged Fly
 # secret; bucket wipe with verified-empty accounting) behind type-to-confirm. Steps 4-6
 # (deploy/health/seed) are NOT built — the report prints them as manual next actions.
-# DESTRUCTIVE PATH IS SCRATCH-UNVALIDATED until the plan's build-order step 4 runs it end-to-end.
 #
 # Re-run convergence: progress is journaled to the state dir. Re-running after ANY partial failure
 # resumes: completed steps are skipped, an already-deleted database is treated as delete-done, and
@@ -25,8 +24,8 @@
 # automation (the scratch harness); never pass it without having read the printed plan of record.
 #
 # The tool shells out ONLY to provider CLIs: pscale, fly(ctl), aws, gh, psql, curl, jq.
-# Overrides for machines where aws/psql are not on PATH:
-#   PSFLY_AWS   e.g. "$HOME/.local/share/psfly repave/aws-venv/bin/aws"
+# Overrides for machines where aws/psql are not on PATH (word-split, so no spaces in paths):
+#   PSFLY_AWS   e.g. "$HOME/.venvs/aws/bin/aws"
 #   PSFLY_PSQL  e.g. "docker run --rm postgres:18.4 psql"
 #
 # Every run writes a timestamped transcript to ${XDG_STATE_HOME:-~/.local/state}/psfly/.
@@ -429,7 +428,7 @@ fi
 if step_done credentials; then
   log "skip: credentials already minted + staged (journal)"
 else
-  ROLE_NAME="envreset-$(date -u +%Y%m%d%H%M%S)"
+  ROLE_NAME="repave-$(date -u +%Y%m%d%H%M%S)"
   log "minting role '$ROLE_NAME' on $PS_DATABASE/$PS_BRANCH (inherited-roles: $PS_ROLE_INHERIT) ..."
   ROLE_JSON=$(pscale role create "$PS_DATABASE" "$PS_BRANCH" "$ROLE_NAME" --org "$PS_ORG" \
       --inherited-roles "$PS_ROLE_INHERIT" --format json </dev/null) \

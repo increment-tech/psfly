@@ -15,7 +15,6 @@ on:
     paths-ignore:
       - '**.md'
       - 'docs/**'
-      - '.claude/**'
   # Manual re-deploy of the current main — e.g. the repave recovery deploy (a hard reset
   # stages a new DATABASE_URL and needs a deploy with no new code to apply it and
   # re-migrate the empty database from the image). paths-ignore does not apply to dispatch.
