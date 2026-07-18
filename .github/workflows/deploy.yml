@@ -20,6 +20,11 @@ on:
         required: false
         type: number
         default: 12
+      flyctl-version:
+        description: flyctl version to install (pinned — never latest)
+        required: false
+        type: string
+        default: 0.4.71
     secrets:
       FLY_API_TOKEN:
         description: Fly.io deploy token for the target app
@@ -39,16 +44,21 @@ jobs:
       - uses: actions/checkout@v4
 
       # setup-flyctl runs WITHOUT the token in scope (the secret is on the deploy step
-      # only, below), so a compromised action can't exfiltrate it. Pinned to a commit SHA,
-      # not a floating tag: with the token step-scoped, a compromised floating ref could
-      # still PATH-shadow flyctl to run inside that step — the pin removes that. Bump
-      # deliberately, verifying the new SHA.
+      # only, below), so a compromised action can't exfiltrate it. The ACTION is pinned to
+      # a commit SHA, not a floating tag: with the token step-scoped, a compromised
+      # floating ref could still PATH-shadow flyctl to run inside that step — the pin
+      # removes that. The flyctl BINARY is version-pinned too (the action defaults to
+      # `latest` otherwise). Bump both deliberately, verifying the new SHA/version.
       - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+        with:
+          version: ${{ inputs.flyctl-version }}
 
       # The deploy strategy lives in the fly config's [deploy] section. Do NOT add
       # `--strategy` here: the CLI flag silently OVERRIDES the toml, and that pair WILL
-      # drift. The token is scoped to THIS step only, not the whole job.
+      # drift. The token is scoped to THIS step only, not the whole job. The config path
+      # goes through an env var so a quoting-hostile value can't splice the shell line.
       - name: Deploy
-        run: flyctl deploy --remote-only -c ${{ inputs.fly-config }}
+        run: flyctl deploy --remote-only -c "$FLY_CONFIG"
         env:
+          FLY_CONFIG: ${{ inputs.fly-config }}
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

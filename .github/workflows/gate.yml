@@ -88,10 +88,12 @@ jobs:
           mix local.rebar --force
 
       # Restore deps, _build, and the dialyzer PLTs BEFORE fetch/compile so the cache
-      # actually helps. Keyed on the pin source + the lockfile, so a toolchain bump or a
-      # dep change busts it. ~/.mix holds dialyxir's CORE PLT (OTP + stdlib), outside
-      # _build — without it every run rebuilds the expensive core PLT. priv/plts covers
-      # repos that set a plt_local_path.
+      # actually helps. The toolchain hash comes FIRST in the key and bounds the
+      # restore-keys prefix, so a lockfile change restores the nearest same-toolchain
+      # cache but an Elixir/OTP bump never restores another toolchain's _build/PLTs.
+      # ~/.mix holds dialyxir's CORE PLT (OTP + stdlib), outside _build — without it
+      # every run rebuilds the expensive core PLT. priv/plts covers repos that set a
+      # plt_local_path.
       - name: Cache deps, _build, and PLTs
         uses: actions/cache@v4
         with:
@@ -100,9 +102,9 @@ jobs:
             _build
             ~/.mix
             priv/plts
-          key: ${{ runner.os }}-mix-${{ hashFiles('mise.toml', 'mix.lock') }}
+          key: ${{ runner.os }}-mix-${{ hashFiles('mise.toml') }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-
+            ${{ runner.os }}-mix-${{ hashFiles('mise.toml') }}-
 
       - name: Fetch deps
         run: mix deps.get
@@ -140,9 +142,10 @@ jobs:
 
       # A dev-keyed cache: dialyzer builds in :dev while the gate job builds in :test, and
       # GitHub caches are immutable per key — sharing one key would freeze whichever env
-      # saved first. The lockfile is in the key so each dep change persists a fresh PLT;
-      # restore-keys falls back to the nearest same-toolchain PLT, which dialyzer then
-      # updates incrementally. Covers both PLT homes (~/.mix core; priv/plts local).
+      # saved first. Toolchain hash first (bounding the restore prefix), lockfile second:
+      # each dep change persists a fresh PLT, restore falls back only to a SAME-toolchain
+      # PLT, which dialyzer updates incrementally. Covers both PLT homes (~/.mix core;
+      # priv/plts local).
       - name: Cache deps, dev _build, and PLTs
         uses: actions/cache@v4
         with:
@@ -151,9 +154,9 @@ jobs:
             _build
             ~/.mix
             priv/plts
-          key: ${{ runner.os }}-mix-dev-${{ hashFiles('mise.toml', 'mix.lock') }}
+          key: ${{ runner.os }}-mix-dev-${{ hashFiles('mise.toml') }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-dev-
+            ${{ runner.os }}-mix-dev-${{ hashFiles('mise.toml') }}-
 
       - name: Fetch deps
         run: mix deps.get

@@ -4,8 +4,8 @@ Bootstrap and operate Elixir apps on the **Fly.io + PlanetScale Postgres + Tigri
 one kit holding the CI/CD workflows, the shared tooling, and the environment-operations CLI,
 so a new repo installs the kit instead of porting a sibling repo's copy.
 
-**Status: pre-release.** The `repave` verb works and the reusable gate/deploy workflows
-exist; composite actions and the `init`/`doctor` verbs are being assembled.
+**Status:** the `repave` verb and the reusable gate/deploy workflows are in use against
+real repos. The `init` and `doctor` verbs are planned, not built.
 
 ## The CLI
 
@@ -28,8 +28,10 @@ topology: Fly app + PlanetScale database (`DATABASE_URL` secret) + Tigris bucket
 ## The CI kit — reusable workflows
 
 Consuming repos carry only thin caller shims (see `templates/`); the logic lives here and
-is consumed by reference, pinned to a tag. The caller owns the triggers, paths filter, and
-concurrency; the kit owns the runner, toolchain, caching, and the safety rules.
+is consumed by reference. Pin an **immutable release tag** (`v1.0.0`-style) or a commit
+SHA — a moving major tag like `@v1` is convenient inside one fleet but is not a stability
+guarantee. The caller owns the triggers, paths filter, concurrency, and the gate→deploy
+ordering (`needs:`); the kit owns the runner, toolchain, caching, and the pinning rules.
 
 - **`.github/workflows/gate.yml`** — the quality gate. The gate *surface* is the consuming
   repo's own gate command (default `bin/precommit`), so CI and the local pre-commit hook
@@ -59,5 +61,4 @@ apps, databases, and buckets. The kit reads config; it hardcodes nothing about a
 
 - `psfly init` — wire a new repo: caller workflows, fly toml skeletons, `.psfly/` config.
 - `psfly doctor` — read-only environment/wiring readiness check.
-- Reusable GitHub Actions workflows and composite actions: gate (compile, format, credo,
-  tests), deploy from a repo's fly config, ephemeral PR preview environments.
+- An ephemeral PR preview-environment reusable workflow.
