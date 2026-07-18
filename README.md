@@ -43,6 +43,13 @@ concurrency; the kit owns the runner, toolchain, caching, and the safety rules.
   and that pair drifts. Inputs: `fly-config`, `timeout-minutes`; secret: `FLY_API_TOKEN`.
   Callers must `needs:` a gate job — a red revision never deploys.
 
+### `psfly compile-check` / `psfly warnings`
+
+Token- and noise-frugal compile loop for the nearest enclosing Mix project, from anywhere
+inside it. `compile-check` compiles quietly to `tmp/compile.log`, failing only on a hard
+error and printing a one-line warning count; `warnings` shows only the warnings not
+already accepted in the repo's `priv/known_warnings.txt`.
+
 ## Configuration
 
 Each consuming repo commits flat `KEY=VALUE` files under `.psfly/<env>.conf` naming its own

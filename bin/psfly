@@ -6,6 +6,8 @@
 #
 # Usage:
 #   psfly repave <env> [--preflight-only] [--yes-i-typed-the-names]   # hard-reset a disposable env
+#   psfly compile-check          # quiet compile of the current repo; full log to tmp/compile.log
+#   psfly warnings [logfile]     # new compiler warnings only (filters priv/known_warnings.txt)
 #   psfly help
 #
 # Planned: init, update, doctor.
@@ -24,11 +26,11 @@ ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
 cmd="${1:-help}"
 shift || true
 case "$cmd" in
-  repave) exec "$ROOT/tools/repave" "$@" ;;
+  repave|compile-check|warnings) exec "$ROOT/tools/$cmd" "$@" ;;
   init|update|doctor)
     echo "psfly: '$cmd' is not implemented yet — see README.md" >&2
     exit 2
     ;;
-  help|-h|--help) sed -n '2,11p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,13p' "$SELF" | sed 's/^# \{0,1\}//' ;;
   *) echo "psfly: unknown command '$cmd' (try: psfly help)" >&2; exit 2 ;;
 esac

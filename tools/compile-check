@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Compile the current repo to tmp/compile.log. Fail ONLY on a hard compile error.
+#
+# Elixir 1.20's type-inference warnings are non-blocking: they do NOT fail the build. They are written
+# to the log and NOT echoed, so they don't flood output or eat tokens. Only a one-line count is shown.
+# Inspect them with `psfly warnings` (which hides warnings already listed in priv/known_warnings.txt).
+#
+# Runs against the nearest enclosing Mix project — invoke from anywhere inside the target repo.
+set -uo pipefail
+
+dir="$PWD"
+while [ "$dir" != "/" ] && [ ! -f "$dir/mix.exs" ]; do dir="$(dirname "$dir")"; done
+[ -f "$dir/mix.exs" ] || { echo "compile-check: no mix.exs at or above $PWD" >&2; exit 2; }
+cd "$dir" || exit 1
+mkdir -p tmp
+
+if ! mix compile > tmp/compile.log 2>&1; then
+  tail -n 40 tmp/compile.log
+  echo "compile error (see tmp/compile.log)"
+  exit 1
+fi
+
+total="$(grep -cE 'warning:' tmp/compile.log || true)"
+echo "compile ok — ${total} warning(s) in tmp/compile.log (psfly warnings shows only new ones)"
+exit 0

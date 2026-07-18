@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Print compiler warnings from a build log with the accepted/expected ones (priv/known_warnings.txt)
+# filtered out, so you read only the new/interesting warnings instead of the full flood.
+# Non-blocking: always exits 0. Warnings never fail the build; this is only a viewer.
+#
+# Runs against the nearest enclosing Mix project — invoke from anywhere inside the target repo.
+#
+# Usage: psfly warnings [logfile]   (default: tmp/compile.log)
+set -uo pipefail
+
+dir="$PWD"
+while [ "$dir" != "/" ] && [ ! -f "$dir/mix.exs" ]; do dir="$(dirname "$dir")"; done
+[ -f "$dir/mix.exs" ] || { echo "warnings: no mix.exs at or above $PWD" >&2; exit 2; }
+cd "$dir" || exit 1
+
+log="${1:-tmp/compile.log}"
+known="priv/known_warnings.txt"
+[ -f "$log" ] || { echo "no log at ${log}"; exit 0; }
+
+out="$(grep -nE 'warning:' "$log" || true)"
+if [ -f "$known" ]; then
+  while IFS= read -r pat; do
+    case "$pat" in '' | \#*) continue ;; esac
+    out="$(printf '%s\n' "$out" | grep -vF "$pat" || true)"
+  done < "$known"
+fi
+
+if [ -n "$out" ]; then
+  printf '%s\n' "$out"
+else
+  echo "no new warnings (full log: ${log})"
+fi
+exit 0
