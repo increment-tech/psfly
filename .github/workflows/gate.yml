@@ -1,0 +1,163 @@
+# Reusable quality gate for an Elixir repo on the psfly stack.
+#
+# Call from a consuming repo with a job-level `uses:`; the CALLER owns the triggers
+# (pull_request, push, dispatch), concurrency, and paths filters — GitHub only fires
+# workflows defined in the repo itself. See templates/ for the canonical callers.
+#
+# The gate SURFACE lives in the consuming repo's gate command (default `bin/precommit`),
+# so CI and the local pre-commit hook can never drift apart — this workflow provides the
+# runner, the pinned toolchain, the Postgres service, and the caching.
+#
+# Toolchain: installed by mise from the consuming repo's mise.toml — the ONE pin source.
+# No Elixir/OTP version literal lives in CI.
+name: gate
+
+on:
+  workflow_call:
+    inputs:
+      postgres-db:
+        description: Test database name (what config/test.exs expects)
+        required: true
+        type: string
+      postgres-port:
+        description: Host port to publish Postgres on (what config/test.exs connects to)
+        required: false
+        type: number
+        default: 5432
+      postgres-image:
+        description: Postgres image for the test database service
+        required: false
+        type: string
+        default: postgres:18.4
+      gate-command:
+        description: The command that runs the whole gate surface
+        required: false
+        type: string
+        default: bin/precommit
+      parallel-dialyzer:
+        description: >-
+          Run dialyzer as a separate parallel job, making gate wall-clock the max of
+          (tests, dialyzer) instead of their sum. Enable ONLY when the gate command
+          itself does NOT run dialyzer — otherwise it runs twice.
+        required: false
+        type: boolean
+        default: false
+      timeout-minutes:
+        description: Per-job ceiling so a hung tool can't run indefinitely
+        required: false
+        type: number
+        default: 15
+
+# Least privilege: the gate only reads the repo (no writes, no packages). A called
+# workflow can never elevate beyond the caller; this pins the floor regardless of
+# repo/org token defaults.
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+
+    services:
+      postgres:
+        image: ${{ inputs.postgres-image }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ${{ inputs.postgres-db }}
+        ports:
+          - ${{ inputs.postgres-port }}:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Elixir/OTP from the repo's mise.toml — the single pin source CI reads.
+      - name: Set up the pinned toolchain (mise)
+        uses: jdx/mise-action@v4
+
+      - name: Install Hex + Rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      # Restore deps, _build, and the dialyzer PLTs BEFORE fetch/compile so the cache
+      # actually helps. Keyed on the pin source + the lockfile, so a toolchain bump or a
+      # dep change busts it. ~/.mix holds dialyxir's CORE PLT (OTP + stdlib), outside
+      # _build — without it every run rebuilds the expensive core PLT. priv/plts covers
+      # repos that set a plt_local_path.
+      - name: Cache deps, _build, and PLTs
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.mix
+            priv/plts
+          key: ${{ runner.os }}-mix-${{ hashFiles('mise.toml', 'mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-
+
+      - name: Fetch deps
+        run: mix deps.get
+
+      # A gate command that probes optional tools with `mix help <task>` only discovers a
+      # dep's mix tasks once the dep is COMPILED — on a cold runner a bare deps.get turns
+      # the probe into a false red. Compile deps before the gate probes them.
+      - name: Compile deps
+        run: mix deps.compile
+
+      # CI=true explicitly, so a skip-becomes-fail backstop in the gate command doesn't
+      # depend on the runner's env defaults.
+      - name: Run the gate
+        env:
+          CI: "true"
+        run: ${{ inputs.gate-command }}
+
+  # Optional parallel dialyzer lane — the slowest single check runs beside the suite.
+  # Runs in MIX_ENV=dev (dialyxir's default env), needs no Postgres.
+  dialyzer:
+    name: Dialyzer
+    if: ${{ inputs.parallel-dialyzer }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up the pinned toolchain (mise)
+        uses: jdx/mise-action@v4
+
+      - name: Install Hex + Rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      # A dev-keyed cache: dialyzer builds in :dev while the gate job builds in :test, and
+      # GitHub caches are immutable per key — sharing one key would freeze whichever env
+      # saved first. The lockfile is in the key so each dep change persists a fresh PLT;
+      # restore-keys falls back to the nearest same-toolchain PLT, which dialyzer then
+      # updates incrementally. Covers both PLT homes (~/.mix core; priv/plts local).
+      - name: Cache deps, dev _build, and PLTs
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+            ~/.mix
+            priv/plts
+          key: ${{ runner.os }}-mix-dev-${{ hashFiles('mise.toml', 'mix.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-mix-dev-
+
+      - name: Fetch deps
+        run: mix deps.get
+
+      # Builds the PLT if missing, then analyzes — one step.
+      - name: Run dialyzer
+        run: mix dialyzer --format github

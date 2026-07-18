@@ -4,8 +4,8 @@ Bootstrap and operate Elixir apps on the **Fly.io + PlanetScale Postgres + Tigri
 one kit holding the CI/CD workflows, the shared tooling, and the environment-operations CLI,
 so a new repo installs the kit instead of porting a sibling repo's copy.
 
-**Status: pre-release.** The `repave` verb works; the CI kit (reusable workflows and
-composite actions) is being assembled.
+**Status: pre-release.** The `repave` verb works and the reusable gate/deploy workflows
+exist; composite actions and the `init`/`doctor` verbs are being assembled.
 
 ## The CLI
 
@@ -24,6 +24,24 @@ topology: Fly app + PlanetScale database (`DATABASE_URL` secret) + Tigris bucket
   (you retype the resource names).
 - **Re-run convergent:** progress is journaled, so re-running after any partial failure
   resumes — completed steps are skipped, credentials are re-minted fresh.
+
+## The CI kit — reusable workflows
+
+Consuming repos carry only thin caller shims (see `templates/`); the logic lives here and
+is consumed by reference, pinned to a tag. The caller owns the triggers, paths filter, and
+concurrency; the kit owns the runner, toolchain, caching, and the safety rules.
+
+- **`.github/workflows/gate.yml`** — the quality gate. The gate *surface* is the consuming
+  repo's own gate command (default `bin/precommit`), so CI and the local pre-commit hook
+  can never drift. Elixir/OTP come from the repo's `mise.toml` via mise — no version
+  literal in CI. Inputs: `postgres-db` (required), `postgres-port`, `postgres-image`,
+  `gate-command`, `parallel-dialyzer` (a separate dialyzer lane for gate commands that
+  skip it — wall-clock becomes max, not sum), `timeout-minutes`.
+- **`.github/workflows/deploy.yml`** — Fly.io deploy. SHA-pinned `setup-flyctl` with the
+  token scoped to the deploy step only, and **no `--strategy` flag** — the strategy lives
+  in the fly config's `[deploy]` section, because the CLI flag silently overrides the toml
+  and that pair drifts. Inputs: `fly-config`, `timeout-minutes`; secret: `FLY_API_TOKEN`.
+  Callers must `needs:` a gate job — a red revision never deploys.
 
 ## Configuration
 

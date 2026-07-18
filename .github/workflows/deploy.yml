@@ -1,0 +1,54 @@
+# Reusable Fly.io deploy for a repo on the psfly stack.
+#
+# Call from the consuming repo's deploy workflow, which owns the triggers, paths
+# filter, and concurrency group — and which must `needs:` a gate job so a red
+# revision never deploys. See templates/deploy.yml for the canonical caller.
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      fly-config:
+        description: >-
+          Path to the fly config to deploy. Its [deploy] section owns the strategy;
+          its release_command migrates the database before traffic cuts over.
+        required: false
+        type: string
+        default: fly.staging.toml
+      timeout-minutes:
+        description: Ceiling for remote build + release_command + deploy
+        required: false
+        type: number
+        default: 12
+    secrets:
+      FLY_API_TOKEN:
+        description: Fly.io deploy token for the target app
+        required: true
+
+# Least privilege: deploy auth is the Fly token (scoped to the deploy step below);
+# the workflow itself only needs to read the repo.
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # setup-flyctl runs WITHOUT the token in scope (the secret is on the deploy step
+      # only, below), so a compromised action can't exfiltrate it. Pinned to a commit SHA,
+      # not a floating tag: with the token step-scoped, a compromised floating ref could
+      # still PATH-shadow flyctl to run inside that step — the pin removes that. Bump
+      # deliberately, verifying the new SHA.
+      - uses: superfly/flyctl-actions/setup-flyctl@ed8efb33836e8b2096c7fd3ba1c8afe303ebbff1
+
+      # The deploy strategy lives in the fly config's [deploy] section. Do NOT add
+      # `--strategy` here: the CLI flag silently OVERRIDES the toml, and that pair WILL
+      # drift. The token is scoped to THIS step only, not the whole job.
+      - name: Deploy
+        run: flyctl deploy --remote-only -c ${{ inputs.fly-config }}
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

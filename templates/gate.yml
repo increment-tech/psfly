@@ -1,0 +1,21 @@
+# Caller shim for the psfly reusable gate — copy to .github/workflows/gate.yml in the
+# consuming repo (psfly init will write this). This file owns the PR trigger; the logic
+# lives in the kit. It deliberately does NOT trigger on `push`: pushes to main are gated
+# inside the deploy workflow (deploy.yml's gate job) — a push trigger here would run the
+# gate twice and starve the deploy job's runner.
+name: gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    uses: increment-tech/psfly/.github/workflows/gate.yml@v1
+    with:
+      postgres-db: myapp_test # what config/test.exs expects
+      # postgres-port: 5432        # if config/test.exs pins a non-default port
+      # gate-command: bin/precommit
+      # parallel-dialyzer: true    # only if the gate command skips dialyzer

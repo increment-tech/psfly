@@ -1,0 +1,44 @@
+# Caller shim for the psfly reusable deploy — copy to .github/workflows/deploy.yml in the
+# consuming repo (psfly init will write this). This file owns the triggers, paths filter,
+# and concurrency; the logic lives in the kit. Gate-then-deploy: staging is never deployed
+# for a red main.
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    # Skip the gate + deploy when a push touches ONLY docs/planning files (skipped only if
+    # EVERY changed file matches). `.github/workflows/**` is NOT listed, so workflow-YAML
+    # changes always run. If a frozen test asserts on a specific markdown file, switch to a
+    # `paths:` block with negations and re-include that file — a docs-only push must not be
+    # able to land a red main.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.claude/**'
+  # Manual re-deploy of the current main — e.g. the repave recovery deploy (a hard reset
+  # stages a new DATABASE_URL and needs a deploy with no new code to apply it and
+  # re-migrate the empty database from the image). paths-ignore does not apply to dispatch.
+  workflow_dispatch:
+
+concurrency:
+  # Serialize main deploys — a new push queues behind the in-flight one.
+  group: deploy-main
+
+permissions:
+  contents: read
+
+jobs:
+  # The full quality gate. Same inputs as the PR caller (templates/gate.yml).
+  gate:
+    uses: increment-tech/psfly/.github/workflows/gate.yml@v1
+    with:
+      postgres-db: myapp_test
+
+  deploy:
+    needs: gate
+    uses: increment-tech/psfly/.github/workflows/deploy.yml@v1
+    with:
+      fly-config: fly.staging.toml
+    secrets:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
