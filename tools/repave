@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# psfly repave — hard-reset a DISPOSABLE environment (staging / preview) of a repo that follows the shared
+# topology: Fly app + PlanetScale Postgres (DATABASE_URL secret) + Tigris bucket (AWS_*/BUCKET_NAME
+# secrets) + CD on push to main with `release_command /app/bin/migrate`.
+#
+# Usage (run from anywhere INSIDE the target repo):
+#   psfly repave <env> [--preflight-only] [--yes-i-typed-the-names]
+#
+# Config: <repo>/.psfly/<env>.conf — flat KEY=VALUE, committed (see README.md).
+#
+# THIS VERSION (0.2.0) IMPLEMENTS: config loader, structural guardrails, the read-only preflight,
+# and the DESTRUCTIVE steps 2-3 (PlanetScale database delete+recreate + fresh role + staged Fly
+# secret; bucket wipe with verified-empty accounting) behind type-to-confirm. Steps 4-6
+# (deploy/health/seed) are NOT built — the report prints them as manual next actions.
+# DESTRUCTIVE PATH IS SCRATCH-UNVALIDATED until the plan's build-order step 4 runs it end-to-end.
+#
+# Re-run convergence: progress is journaled to the state dir. Re-running after ANY partial failure
+# resumes: completed steps are skipped, an already-deleted database is treated as delete-done, and
+# credentials are re-minted fresh (a stale staged secret is simply overwritten). While a journal
+# exists, the preflight checks that a mid-reset state legitimately breaks (PlanetScale db identity,
+# app-URL db bind) soften to SOFT notes; all other checks stay hard. The journal is removed by the
+# OPERATOR (rm) once deploy+health+seed have converged — the report says exactly when.
+#
+# --yes-i-typed-the-names skips the interactive type-to-confirm. It is an operator attestation for
+# automation (the scratch harness); never pass it without having read the printed plan of record.
+#
+# The tool shells out ONLY to provider CLIs: pscale, fly(ctl), aws, gh, psql, curl, jq.
+# Overrides for machines where aws/psql are not on PATH:
+#   PSFLY_AWS   e.g. "$HOME/.local/share/psfly repave/aws-venv/bin/aws"
+#   PSFLY_PSQL  e.g. "docker run --rm postgres:18.4 psql"
+#
+# Every run writes a timestamped transcript to ${XDG_STATE_HOME:-~/.local/state}/psfly/.
+# Scraped secrets (DATABASE_URL, AWS_*) are NEVER written to the transcript — only their presence
+# and the assertions made against them.
+set -euo pipefail
+
+SCRIPT_VERSION="0.2.0"
+SUPPORTED_CONFIG_SCHEMA="1"
+
+# ---------------------------------------------------------------- helpers ---
+
+die() { printf 'psfly repave: FATAL: %s\n' "$*" >&2; exit 1; }
+log() { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
+
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# ------------------------------------------------------------------- args ---
+
+ENV_ARG=""
+PREFLIGHT_ONLY=0
+YES_FLAG=0
+for a in "$@"; do
+  case "$a" in
+    --preflight-only) PREFLIGHT_ONLY=1 ;;
+    --yes-i-typed-the-names) YES_FLAG=1 ;;
+    -h|--help) usage 0 ;;
+    -*) die "unknown flag: $a" ;;
+    *) [[ -z "$ENV_ARG" ]] || die "exactly one <env> argument expected"; ENV_ARG="$a" ;;
+  esac
+done
+[[ -n "$ENV_ARG" ]] || usage 1
+
+# ------------------------------------------------- locate repo + config -----
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) \
+  || die "not inside a git repo — run psfly repave from within the target repo"
+REPO_NAME=$(basename "$REPO_ROOT")
+CONF="$REPO_ROOT/.psfly/$ENV_ARG.conf"
+[[ -f "$CONF" ]] || die "no config for env '$ENV_ARG': $CONF does not exist"
+
+# ------------------------------------------------------------- transcript ---
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/psfly"
+mkdir -p "$STATE_DIR"
+TRANSCRIPT="$STATE_DIR/$REPO_NAME-$ENV_ARG-$(date -u +%Y%m%dT%H%M%SZ).log"
+exec > >(tee -a "$TRANSCRIPT") 2>&1
+log "psfly repave v$SCRIPT_VERSION  repo=$REPO_NAME  env=$ENV_ARG  transcript=$TRANSCRIPT"
+
+# ------------------------------------------------------- journal / resume ---
+
+# The journal records destructive-step completion so ANY partial-failure state converges on plain
+# re-run. Its presence means a reset is in flight: preflight checks that such a state legitimately
+# breaks are softened (below), and the delete step treats an absent database as already-deleted.
+JOURNAL="$STATE_DIR/$REPO_NAME-$ENV_ARG.journal"
+step_done() { grep -qx "done $1" "$JOURNAL" 2>/dev/null; }
+mark_done() { printf 'done %s\n' "$1" >> "$JOURNAL"; log "journal: step '$1' done"; }
+RESUME=0
+if [[ -f "$JOURNAL" && "$PREFLIGHT_ONLY" == 0 ]]; then
+  RESUME=1
+  log "RESUME: in-flight reset journal found ($JOURNAL): $(tr '\n' ';' < "$JOURNAL")"
+fi
+
+# ------------------------------------------------------------ load config ---
+
+# Pre-scan: a config is DATA. Refuse any line that is not a comment, blank, a plain KEY=VALUE
+# (no shell metacharacters), or the single SEED_CMDS array line — before we source it.
+BAD_LINES=$(grep -Env \
+  '^[[:space:]]*(#|$)|^[A-Z][A-Z0-9_]*=[^;&|<>`$(){}]*$|^SEED_CMDS=\(.*\)[[:space:]]*$' \
+  "$CONF" || true)
+[[ -z "$BAD_LINES" ]] || die "config has non-KEY=VALUE lines (refusing to source):
+$BAD_LINES"
+
+# shellcheck disable=SC1090
+source "$CONF"
+
+REQUIRED_KEYS=(CONFIG_SCHEMA ENV_NAME DISPOSABLE FLY_APP PS_ORG PS_DATABASE PS_BRANCH PS_REGION
+  PS_CLUSTER_SIZE PS_MAJOR_VERSION PS_ROLE_INHERIT BUCKET S3_ENDPOINT DEPLOY_WORKFLOW HEALTH_URL)
+for k in "${REQUIRED_KEYS[@]}"; do
+  [[ -n "${!k:-}" ]] || die "config is missing required key: $k"
+done
+declare -p SEED_CMDS >/dev/null 2>&1 || die "config is missing SEED_CMDS=( ... )"
+[[ "$(declare -p SEED_CMDS)" == "declare -a"* ]] || die "SEED_CMDS must be a bash array"
+[[ ${#SEED_CMDS[@]} -ge 1 ]] || die "SEED_CMDS is empty — a reset without re-seed ends in an unloginable console; declare it explicitly"
+
+[[ "$CONFIG_SCHEMA" == "$SUPPORTED_CONFIG_SCHEMA" ]] \
+  || die "config declares CONFIG_SCHEMA=$CONFIG_SCHEMA but this script supports $SUPPORTED_CONFIG_SCHEMA"
+
+# ------------------------------------------------ guardrail 1: disposable ---
+
+[[ "$DISPOSABLE" == "true" ]] || die "config does not declare DISPOSABLE=true — refusing"
+[[ "$ENV_NAME" == "$ENV_ARG" ]] || die "config ENV_NAME='$ENV_NAME' does not match requested env '$ENV_ARG'"
+shopt -s nocasematch
+if [[ "$ENV_NAME" =~ (prod|live) ]]; then
+  shopt -u nocasematch
+  die "ENV_NAME '$ENV_NAME' matches a production-looking name — refusing"
+fi
+shopt -u nocasematch
+log "guardrail 1 OK: env '$ENV_NAME' declared disposable"
+
+# ---------------------------------------- guardrail 2: never-prod cross-check
+
+# Parse the repo's PRODUCTION fly.toml and refuse if any of our target identities collide with a
+# production identity found there. (Production DB / bucket names are secrets, not in the toml, so the
+# comparable identities are the app name and PHX_HOST — plus we refuse if any of our names equals the
+# prod app name, since DB and bucket conventionally share it.)
+PROD_TOML="$REPO_ROOT/fly.toml"
+PROD_IDS=()
+if [[ -f "$PROD_TOML" ]]; then
+  PROD_APP=$(sed -n "s/^app *= *['\"]\([^'\"]*\)['\"].*/\1/p" "$PROD_TOML" | head -1)
+  PROD_HOST=$(sed -n "s/^ *PHX_HOST *= *['\"]\([^'\"]*\)['\"].*/\1/p" "$PROD_TOML" | head -1)
+  [[ -n "$PROD_APP" ]] && PROD_IDS+=("$PROD_APP")
+  [[ -n "$PROD_HOST" ]] && PROD_IDS+=("$PROD_HOST")
+  [[ ${#PROD_IDS[@]} -gt 0 ]] || die "found $PROD_TOML but could not parse any identity from it — refusing on an unverifiable never-prod check"
+  for prod_id in "${PROD_IDS[@]}"; do
+    for mine in "$FLY_APP" "$PS_DATABASE" "$BUCKET"; do
+      [[ "$mine" == "$prod_id" ]] \
+        && die "target identity '$mine' equals PRODUCTION identity '$prod_id' (from fly.toml) — refusing"
+    done
+  done
+  log "guardrail 2 OK: no target identity collides with production ($PROD_TOML: ${PROD_IDS[*]})"
+else
+  log "guardrail 2 WARNING: no $PROD_TOML found — never-prod cross-check had nothing to compare; verify manually that '$FLY_APP'/'$PS_DATABASE'/'$BUCKET' are not production"
+fi
+
+# --------------------------------------------------------------- preflight --
+
+# Tool discovery (aws/psql may live off PATH; overrides documented in the header).
+read -ra AWS_CMD  <<< "${PSFLY_AWS:-aws}"
+read -ra PSQL_CMD <<< "${PSFLY_PSQL:-psql}"
+# Homebrew's libpq is keg-only (psql deliberately not linked onto PATH) — fall back to the keg.
+if [[ -z "${PSFLY_PSQL:-}" ]] && ! command -v psql >/dev/null 2>&1; then
+  for keg in /opt/homebrew/opt/libpq/bin/psql /usr/local/opt/libpq/bin/psql; do
+    [[ -x "$keg" ]] && { PSQL_CMD=("$keg"); break; }
+  done
+fi
+
+PF_FAILED=0
+declare -a PF_SUMMARY
+pf_pass() { PF_SUMMARY+=("PASS  $1"); log "PASS  $1"; }
+pf_fail() { PF_SUMMARY+=("FAIL  $1 — $2"); log "FAIL  $1 — $2"; PF_FAILED=1; }
+# For checks a mid-reset state legitimately breaks (db deleted / creds rotated but not deployed):
+# SOFT in resume mode — the destructive steps re-verify convergently — hard everywhere else.
+pf_fail_or_soft() {
+  if [[ "$RESUME" == 1 ]]; then
+    PF_SUMMARY+=("SOFT  $1 — $2 (tolerated: resuming an in-flight reset)")
+    log "SOFT  $1 — $2 (tolerated: resuming an in-flight reset)"
+  else
+    pf_fail "$1" "$2"
+  fi
+}
+
+log "--- preflight (read-only) ---"
+
+# P1: provider CLIs present + authenticated
+for tool in pscale fly gh jq curl; do
+  command -v "$tool" >/dev/null 2>&1 && pf_pass "cli: $tool present" \
+    || pf_fail "cli: $tool" "not on PATH"
+done
+command -v "${AWS_CMD[0]}" >/dev/null 2>&1 && pf_pass "cli: aws present (${AWS_CMD[*]})" \
+  || pf_fail "cli: aws" "'${AWS_CMD[*]}' not found — brew install awscli, or set PSFLY_AWS"
+command -v "${PSQL_CMD[0]}" >/dev/null 2>&1 && pf_pass "cli: psql present (${PSQL_CMD[*]})" \
+  || pf_fail "cli: psql" "'${PSQL_CMD[*]}' not found — brew install libpq, or set PSFLY_PSQL"
+
+if FLY_WHO=$(fly auth whoami 2>/dev/null); then
+  pf_pass "auth: fly ($FLY_WHO)"
+else
+  pf_fail "auth: fly" "fly auth whoami failed"
+fi
+if gh auth status >/dev/null 2>&1; then
+  pf_pass "auth: gh"
+else
+  pf_fail "auth: gh" "gh auth status failed"
+fi
+
+# P2: PlanetScale database + branch identity (also proves pscale auth)
+if PS_DB_JSON=$(pscale database show "$PS_DATABASE" --org "$PS_ORG" --format json </dev/null 2>&1); then
+  ps_kind=$(jq -r '.kind // empty' <<<"$PS_DB_JSON")
+  ps_region=$(jq -r '.region.slug // empty' <<<"$PS_DB_JSON")
+  ps_state=$(jq -r '.state // empty' <<<"$PS_DB_JSON")
+  [[ "$ps_kind" == "postgresql" ]] && pf_pass "pscale: db '$PS_DATABASE' exists, kind=postgresql" \
+    || pf_fail_or_soft "pscale: db kind" "expected postgresql, got '$ps_kind'"
+  [[ "$ps_region" == "$PS_REGION" ]] && pf_pass "pscale: region $ps_region matches config" \
+    || pf_fail_or_soft "pscale: region" "live '$ps_region' != config '$PS_REGION'"
+  [[ "$ps_state" == "ready" ]] && pf_pass "pscale: db state ready" \
+    || pf_fail_or_soft "pscale: db state" "state '$ps_state'"
+else
+  pf_fail_or_soft "pscale: database show" "$PS_DB_JSON"
+fi
+if PS_BR_JSON=$(pscale branch show "$PS_DATABASE" "$PS_BRANCH" --org "$PS_ORG" --format json </dev/null 2>&1); then
+  br_size=$(jq -r '.cluster_display_name // empty' <<<"$PS_BR_JSON")
+  [[ "$br_size" == "$PS_CLUSTER_SIZE" ]] \
+    && pf_pass "pscale: branch '$PS_BRANCH' exists, cluster $br_size matches config" \
+    || pf_fail_or_soft "pscale: cluster size" "live '$br_size' != config '$PS_CLUSTER_SIZE'"
+else
+  PS_BR_JSON=""
+  pf_fail_or_soft "pscale: branch show" "branch '$PS_BRANCH' not shown"
+fi
+
+# P3: Fly app exists
+if fly status -a "$FLY_APP" >/dev/null 2>&1; then
+  pf_pass "fly: app '$FLY_APP' exists"
+else
+  pf_fail "fly: app '$FLY_APP'" "fly status failed"
+fi
+
+# P4: atomic scrape of the app's own env — ONE shell, ONE machine, one coherent cred set.
+# Values are kept in memory only; never logged.
+SCRAPE=$(fly ssh console -a "$FLY_APP" -C printenv </dev/null 2>/dev/null | tr -d '\r' || true)
+scraped() { printf '%s\n' "$SCRAPE" | sed -n "s/^$1=//p" | head -1; }
+S_DATABASE_URL=$(scraped DATABASE_URL)
+S_BUCKET_NAME=$(scraped BUCKET_NAME)
+S_AWS_ACCESS_KEY_ID=$(scraped AWS_ACCESS_KEY_ID)
+S_AWS_SECRET_ACCESS_KEY=$(scraped AWS_SECRET_ACCESS_KEY)
+S_AWS_REGION=$(scraped AWS_REGION)
+S_AWS_ENDPOINT_URL_S3=$(scraped AWS_ENDPOINT_URL_S3)
+if [[ -z "$SCRAPE" ]]; then
+  pf_fail "scrape: app env" "fly ssh console -C printenv returned nothing"
+else
+  [[ -n "$S_DATABASE_URL" && "$S_DATABASE_URL" == postgres* ]] \
+    && pf_pass "scrape: DATABASE_URL captured (postgres://…, ${#S_DATABASE_URL} chars)" \
+    || pf_fail "scrape: DATABASE_URL" "missing or not postgres://"
+  [[ -n "$S_AWS_ACCESS_KEY_ID" && -n "$S_AWS_SECRET_ACCESS_KEY" ]] \
+    && pf_pass "scrape: AWS cred set captured (coherent, single source)" \
+    || pf_fail "scrape: AWS creds" "AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY missing from app env"
+  [[ "$S_BUCKET_NAME" == "$BUCKET" ]] \
+    && pf_pass "scrape: BUCKET_NAME '$S_BUCKET_NAME' == config BUCKET" \
+    || pf_fail "scrape: BUCKET_NAME" "app says '$S_BUCKET_NAME', config says '$BUCKET'"
+  if [[ -n "$S_AWS_ENDPOINT_URL_S3" ]]; then
+    [[ "$S_AWS_ENDPOINT_URL_S3" == "$S3_ENDPOINT" ]] \
+      && pf_pass "scrape: S3 endpoint matches config" \
+      || pf_fail "scrape: S3 endpoint" "app says '$S_AWS_ENDPOINT_URL_S3', config says '$S3_ENDPOINT'"
+  fi
+fi
+
+# P5: DB identity — connect with the SCRAPED url (the app's own creds) and assert we are looking at
+# the database the config names. TLS is verify-full against system roots unless the URL already pins
+# its own sslmode.
+if [[ -n "$S_DATABASE_URL" ]] && command -v "${PSQL_CMD[0]}" >/dev/null 2>&1; then
+  PSQL_URL="$S_DATABASE_URL"
+  if [[ "$PSQL_URL" != *"sslmode="* ]]; then
+    sep='?'; [[ "$PSQL_URL" == *\?* ]] && sep='&'
+    PSQL_URL="${PSQL_URL}${sep}sslmode=verify-full"
+  else
+    log "note: scraped DATABASE_URL pins its own sslmode; keeping it"
+  fi
+  # Supply the trust store if the URL names none (libpq >= 16); this never weakens the sslmode.
+  if [[ "$PSQL_URL" != *"sslrootcert="* ]]; then
+    sep='?'; [[ "$PSQL_URL" == *\?* ]] && sep='&'
+    PSQL_URL="${PSQL_URL}${sep}sslrootcert=system"
+  fi
+  if DB_ROW=$(PGCONNECT_TIMEOUT=10 "${PSQL_CMD[@]}" "$PSQL_URL" -tA -F'|' \
+       -c "select current_database(), current_user, current_setting('server_version')" 2>&1); then
+    db_name=${DB_ROW%%|*}
+    rest=${DB_ROW#*|}; db_user=${rest%%|*}; db_ver=${rest##*|}
+    db_major=${db_ver%%.*}
+    # Identity bind. current_database() is NOT the PlanetScale database name (the shared regional
+    # gateway routes by USERNAME; the PG database inside the cluster is e.g. 'postgres' — measured
+    # live 2026-07-14). The exact bind is: the connected role must be a role OF (PS_DATABASE,
+    # PS_BRANCH) per the PlanetScale API, which lists roles as '<user>.<branch_id>'.
+    br_id=$(jq -r '.id // empty' <<<"${PS_BR_JSON:-}")
+    ROLE_USERS=$(pscale role list "$PS_DATABASE" "$PS_BRANCH" --org "$PS_ORG" --format json \
+                   </dev/null 2>/dev/null | jq -r '.[].username // empty' || true)
+    if [[ -z "$br_id" || -z "$ROLE_USERS" ]]; then
+      pf_fail_or_soft "db: identity" "could not list roles of $PS_DATABASE/$PS_BRANCH to bind the connected user against"
+    elif grep -qxF "${db_user}.${br_id}" <<<"$ROLE_USERS" || grep -qxF "$db_user" <<<"$ROLE_USERS"; then
+      pf_pass "db: connected as '$db_user' — a live role of $PS_DATABASE/$PS_BRANCH (branch $br_id; current_database()=$db_name)"
+    else
+      pf_fail_or_soft "db: identity" "connected user '$db_user' is NOT a role of $PS_DATABASE/$PS_BRANCH — the app's DATABASE_URL points elsewhere"
+    fi
+    [[ "$db_major" == "$PS_MAJOR_VERSION" ]] \
+      && pf_pass "db: server major version $db_major matches PS_MAJOR_VERSION" \
+      || pf_fail_or_soft "db: major version" "server is $db_ver, config pins PS_MAJOR_VERSION=$PS_MAJOR_VERSION"
+  else
+    pf_fail_or_soft "db: connect with scraped DATABASE_URL" "$(head -2 <<<"$DB_ROW" | tr '\n' ' ')"
+  fi
+else
+  pf_fail "db: identity check" "skipped (no scraped DATABASE_URL or no psql)"
+fi
+
+# P6: bucket versioning must be off/unset — else the wipe would leave billed object versions behind.
+if [[ -n "$S_AWS_ACCESS_KEY_ID" ]] && command -v "${AWS_CMD[0]}" >/dev/null 2>&1; then
+  if VERS_JSON=$(AWS_ACCESS_KEY_ID="$S_AWS_ACCESS_KEY_ID" \
+       AWS_SECRET_ACCESS_KEY="$S_AWS_SECRET_ACCESS_KEY" \
+       AWS_REGION="${S_AWS_REGION:-auto}" \
+       "${AWS_CMD[@]}" s3api get-bucket-versioning --bucket "$BUCKET" \
+         --endpoint-url "$S3_ENDPOINT" --output json 2>&1); then
+    [[ -n "$VERS_JSON" ]] || VERS_JSON='{}'   # aws prints nothing when versioning was never enabled
+    vstatus=$(jq -r '.Status // "unset"' <<<"$VERS_JSON")
+    [[ "$vstatus" == "unset" ]] \
+      && pf_pass "bucket: '$BUCKET' reachable with scraped creds, versioning unset" \
+      || pf_fail "bucket: versioning" "status is '$vstatus' — a wipe would leave billed versions; resolve versioning first"
+  else
+    pf_fail "bucket: get-bucket-versioning" "$(head -2 <<<"$VERS_JSON" | tr '\n' ' ')"
+  fi
+else
+  pf_fail "bucket: versioning check" "skipped (no scraped AWS creds or no aws CLI)"
+fi
+
+# P7: CD idle — never reset while a main deploy is in flight.
+CD_BUSY=0
+for st in in_progress queued; do
+  n=$(cd "$REPO_ROOT" && gh run list --workflow "$DEPLOY_WORKFLOW" --status "$st" \
+        --json databaseId --jq length 2>/dev/null || echo "gh-error")
+  if [[ "$n" == "gh-error" ]]; then
+    pf_fail "cd: $st runs" "gh run list failed for workflow '$DEPLOY_WORKFLOW'"
+    CD_BUSY=1
+  elif [[ "$n" != "0" ]]; then
+    pf_fail "cd: $st runs" "$n run(s) of '$DEPLOY_WORKFLOW' are $st — wait for CD to go idle"
+    CD_BUSY=1
+  fi
+done
+[[ "$CD_BUSY" == 0 ]] && pf_pass "cd: '$DEPLOY_WORKFLOW' idle (nothing in progress or queued)"
+
+# ------------------------------------------------------------- summary ------
+
+log "--- preflight summary ---"
+for line in "${PF_SUMMARY[@]}"; do printf '  %s\n' "$line"; done
+SOFT_COUNT=0
+for line in "${PF_SUMMARY[@]}"; do [[ "$line" == SOFT* ]] && SOFT_COUNT=$((SOFT_COUNT + 1)); done
+if [[ "$PF_FAILED" == 1 ]]; then
+  log "PREFLIGHT: FAILED (transcript: $TRANSCRIPT)"
+elif [[ "$SOFT_COUNT" -gt 0 ]]; then
+  log "PREFLIGHT: PASSED with $SOFT_COUNT SOFT check(s) tolerated by resume mode (transcript: $TRANSCRIPT)"
+else
+  log "PREFLIGHT: ALL CHECKS PASSED (transcript: $TRANSCRIPT)"
+fi
+
+if [[ "$PREFLIGHT_ONLY" == 1 ]]; then
+  exit "$PF_FAILED"
+fi
+
+# --------------------------------------------------------- plan of record ---
+
+[[ "$PF_FAILED" == 0 ]] || die "preflight failed — refusing to go further"
+
+cat <<PLAN
+
+PLAN OF RECORD — psfly repave '$ENV_NAME' of $REPO_NAME
+  1. DB reset:      pscale db delete $PS_DATABASE → db create (postgresql, $PS_REGION, $PS_CLUSTER_SIZE,
+                    replicas 0, major $PS_MAJOR_VERSION) → role create (inherit $PS_ROLE_INHERIT)
+                    → fly secrets import DATABASE_URL --stage -a $FLY_APP       [THIS RUN]
+  2. Bucket wipe:   aws s3 rm s3://$BUCKET --recursive (endpoint $S3_ENDPOINT) → verify 0 keys
+                                                                                [THIS RUN]
+  3. Deploy:        via $DEPLOY_WORKFLOW on main (migrates the empty DB from the deployed image)
+                                                                                [manual until v0.3]
+  4. Health:        poll $HEALTH_URL until 200                                  [manual until v0.3]
+  5. Re-seed:       ${SEED_CMDS[*]}                                             [manual until v0.3]
+
+The app is deliberately NEVER stopped. Steps already journaled as done will be skipped.
+
+PLAN
+
+# ------------------------------------------- guardrail 4: type-to-confirm ---
+
+if [[ "$YES_FLAG" == 1 ]]; then
+  log "confirmation: type-to-confirm SKIPPED via --yes-i-typed-the-names (operator attestation)"
+elif [[ -t 0 && -r /dev/tty ]]; then
+  printf 'Type the PlanetScale database name that will be DELETED AND RECREATED: '
+  IFS= read -r answer </dev/tty
+  [[ "$answer" == "$PS_DATABASE" ]] || die "typed '$answer', expected '$PS_DATABASE' — refusing"
+  printf 'Type the bucket name that will be WIPED: '
+  IFS= read -r answer </dev/tty
+  [[ "$answer" == "$BUCKET" ]] || die "typed '$answer', expected '$BUCKET' — refusing"
+  log "confirmation: both names typed exactly"
+else
+  die "no terminal available for type-to-confirm — pass --yes-i-typed-the-names ONLY from automation that has already surfaced the plan of record"
+fi
+
+[[ -f "$JOURNAL" ]] || printf 'started %s\n' "$(date -u +%Y%m%dT%H%M%SZ)" > "$JOURNAL"
+
+# --------------------------------- step 2: DB reset (riskiest first, plan) ---
+
+log "--- step 2: DB reset ---"
+if step_done db_recreate; then
+  log "skip: database already recreated by this reset (journal)"
+else
+  if pscale database show "$PS_DATABASE" --org "$PS_ORG" </dev/null >/dev/null 2>&1; then
+    log "deleting PlanetScale database $PS_ORG/$PS_DATABASE ..."
+    pscale database delete "$PS_DATABASE" --org "$PS_ORG" --force </dev/null \
+      || die "pscale database delete failed — nothing else was touched; re-run to converge"
+  else
+    [[ "$RESUME" == 1 ]] \
+      || die "database '$PS_DATABASE' is absent on a FRESH run — refusing (preflight should have caught this)"
+    log "delete: database already absent — a prior run's delete converged"
+  fi
+  log "creating PlanetScale database $PS_ORG/$PS_DATABASE (postgresql, $PS_REGION, $PS_CLUSTER_SIZE, replicas 0, major $PS_MAJOR_VERSION) ..."
+  pscale database create "$PS_DATABASE" --org "$PS_ORG" --engine postgresql \
+    --region "$PS_REGION" --cluster-size "$PS_CLUSTER_SIZE" --replicas 0 \
+    --major-version "$PS_MAJOR_VERSION" --wait </dev/null \
+    || die "pscale database create failed — re-run to converge (delete of the absent db is treated as done)"
+  mark_done db_recreate
+fi
+
+# Credentials are one convergent unit: a resume after a half-done credential step simply mints a
+# FRESH role and overwrites the staged secret (roles die with the database on the next reset).
+if step_done credentials; then
+  log "skip: credentials already minted + staged (journal)"
+else
+  ROLE_NAME="envreset-$(date -u +%Y%m%d%H%M%S)"
+  log "minting role '$ROLE_NAME' on $PS_DATABASE/$PS_BRANCH (inherited-roles: $PS_ROLE_INHERIT) ..."
+  ROLE_JSON=$(pscale role create "$PS_DATABASE" "$PS_BRANCH" "$ROLE_NAME" --org "$PS_ORG" \
+      --inherited-roles "$PS_ROLE_INHERIT" --format json </dev/null) \
+    || die "pscale role create failed — re-run to converge (a fresh role will be minted)"
+  r_user=$(jq -r '.username // empty' <<<"$ROLE_JSON")
+  r_pass=$(jq -r '.password // empty' <<<"$ROLE_JSON")
+  r_host=$(jq -r '.access_host_url // empty' <<<"$ROLE_JSON")
+  [[ -n "$r_user" && -n "$r_pass" && -n "$r_host" ]] \
+    || die "role JSON missing username/password/access_host_url — got keys: $(jq -r 'keys|join(",")' <<<"$ROLE_JSON")"
+  enc_user=$(jq -rn --arg v "$r_user" '$v|@uri')
+  enc_pass=$(jq -rn --arg v "$r_pass" '$v|@uri')
+  NEW_DATABASE_URL="postgres://${enc_user}:${enc_pass}@${r_host}:5432/postgres?sslmode=verify-full"
+  # Secret via stdin (never argv); --stage: applied by the next deploy, the running app is untouched.
+  printf 'DATABASE_URL=%s\n' "$NEW_DATABASE_URL" \
+    | fly secrets import --stage -a "$FLY_APP" \
+    || die "fly secrets import --stage failed — re-run to converge (a fresh role will be minted)"
+  log "credentials: role '$ROLE_NAME' minted (user $r_user); DATABASE_URL STAGED on $FLY_APP (applies at next deploy)"
+  mark_done credentials
+fi
+
+# ----------------------------------------------------- step 3: bucket wipe ---
+
+log "--- step 3: bucket wipe ---"
+if step_done bucket_wipe; then
+  log "skip: bucket already wiped + verified empty (journal)"
+else
+  log "wiping s3://$BUCKET (endpoint $S3_ENDPOINT) with the scraped cred set ..."
+  AWS_ACCESS_KEY_ID="$S_AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$S_AWS_SECRET_ACCESS_KEY" \
+    AWS_REGION="${S_AWS_REGION:-auto}" \
+    "${AWS_CMD[@]}" s3 rm "s3://$BUCKET" --recursive --endpoint-url "$S3_ENDPOINT" --only-show-errors \
+    || die "bucket wipe reported errors — re-run to converge (rm of already-deleted keys is a no-op)"
+  # Honest accounting: attempts are not successes — the bucket must LIST empty. Count Contents,
+  # NOT KeyCount: Tigris omits KeyCount/IsTruncated from list-objects-v2 (measured 2026-07-14 — a
+  # KeyCount-based check reads null and would falsely pass on a non-empty bucket).
+  LIST_JSON=$(AWS_ACCESS_KEY_ID="$S_AWS_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$S_AWS_SECRET_ACCESS_KEY" \
+    AWS_REGION="${S_AWS_REGION:-auto}" \
+    "${AWS_CMD[@]}" s3api list-objects-v2 --bucket "$BUCKET" --endpoint-url "$S3_ENDPOINT" \
+      --max-keys 1 --output json) \
+    || die "post-wipe verify could not list the bucket — re-run"
+  [[ -n "$LIST_JSON" ]] || LIST_JSON='{}'
+  KEY_COUNT=$(jq -r '(.Contents // []) | length' <<<"$LIST_JSON")
+  [[ "$KEY_COUNT" == "0" ]] \
+    || die "post-wipe verify FAILED: bucket still lists keys — re-run"
+  log "bucket wipe: verified — list-objects-v2 returns 0 keys"
+  mark_done bucket_wipe
+fi
+
+# ------------------------------------------------------------ step: report ---
+
+NEW_BR_ID=$(pscale branch show "$PS_DATABASE" "$PS_BRANCH" --org "$PS_ORG" --format json </dev/null 2>/dev/null | jq -r '.id // "unknown"')
+step_state() { if step_done "$1"; then echo "done"; else echo "PENDING"; fi; }
+cat <<REPORT
+
+REPORT — psfly repave '$ENV_NAME' of $REPO_NAME (v$SCRIPT_VERSION)
+  db recreate:   $(step_state db_recreate)   ($PS_ORG/$PS_DATABASE, branch $PS_BRANCH, id $NEW_BR_ID)
+  credentials:   $(step_state credentials)   (fresh role; DATABASE_URL staged on $FLY_APP)
+  bucket wipe:   $(step_state bucket_wipe)   (s3://$BUCKET verified 0 keys)
+  transcript:    $TRANSCRIPT
+  journal:       $JOURNAL
+
+NEXT (manual until v0.3 — the env is NOT usable yet: empty DB, app still on the dead old creds):
+  1. Deploy through CD so the staged secret applies and /app/bin/migrate runs the full stack from
+     zero on the deployed image ($DEPLOY_WORKFLOW currently has NO workflow_dispatch — push to main
+     or add the trigger; do NOT 'fly deploy' a local checkout).
+  2. Poll $HEALTH_URL until 200.
+  3. Re-seed: ${SEED_CMDS[*]}
+  4. THEN acknowledge convergence:  rm "$JOURNAL"
+     (while the journal exists, re-runs are resume-mode; a FRESH reset needs it gone)
+REPORT

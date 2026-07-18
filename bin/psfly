@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# psfly — the platform kit for repos on Fly.io + PlanetScale Postgres (+ Tigris storage,
+# GitHub-Actions CD). One repo holds the CI/CD templates, the shared bin tooling, and the
+# environment-operations CLI, so a new repo on this stack installs the kit instead of porting a
+# sibling repo's copy. See README.md.
+#
+# Usage:
+#   psfly repave <env> [--preflight-only] [--yes-i-typed-the-names]   # hard-reset a disposable env
+#   psfly help
+#
+# Planned: init, update, doctor.
+set -euo pipefail
+
+SELF="$0"
+while [ -L "$SELF" ]; do
+  target="$(readlink "$SELF")"
+  case "$target" in
+    /*) SELF="$target" ;;
+    *) SELF="$(dirname "$SELF")/$target" ;;
+  esac
+done
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+  repave) exec "$ROOT/tools/repave" "$@" ;;
+  init|update|doctor)
+    echo "psfly: '$cmd' is not implemented yet — see README.md" >&2
+    exit 2
+    ;;
+  help|-h|--help) sed -n '2,11p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  *) echo "psfly: unknown command '$cmd' (try: psfly help)" >&2; exit 2 ;;
+esac
