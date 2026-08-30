@@ -47,6 +47,13 @@ on:
         required: false
         type: number
         default: 15
+    secrets:
+      PRIVATE_PACKAGES_TOKEN:
+        description: >-
+          Read-only token for private git deps in mix.exs (e.g. increment-tech/phx-harness).
+          When set, git is pointed at it for https://github.com/ before `mix deps.get`. Callers
+          pass it explicitly or use `secrets: inherit`.
+        required: false
 
 # Least privilege: the gate only reads the repo (no writes, no packages). A called
 # workflow can never elevate beyond the caller; this pins the floor regardless of
@@ -106,6 +113,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-${{ hashFiles('mise.toml') }}-
 
+      - name: Authenticate git for private deps (when PRIVATE_PACKAGES_TOKEN is set)
+        env:
+          PRIVATE_PACKAGES_TOKEN: ${{ secrets.PRIVATE_PACKAGES_TOKEN }}
+        run: |
+          [ -n "$PRIVATE_PACKAGES_TOKEN" ] || { echo "no PRIVATE_PACKAGES_TOKEN; assuming no private deps"; exit 0; }
+          git config --global \
+            url."https://x-access-token:${PRIVATE_PACKAGES_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
       - name: Fetch deps
         run: mix deps.get
 
@@ -158,6 +173,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-mix-dev-${{ hashFiles('mise.toml') }}-
 
+      - name: Authenticate git for private deps (when PRIVATE_PACKAGES_TOKEN is set)
+        env:
+          PRIVATE_PACKAGES_TOKEN: ${{ secrets.PRIVATE_PACKAGES_TOKEN }}
+        run: |
+          [ -n "$PRIVATE_PACKAGES_TOKEN" ] || { echo "no PRIVATE_PACKAGES_TOKEN; assuming no private deps"; exit 0; }
+          git config --global \
+            url."https://x-access-token:${PRIVATE_PACKAGES_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
       - name: Fetch deps
         run: mix deps.get
 
