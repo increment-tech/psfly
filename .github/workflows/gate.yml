@@ -47,6 +47,16 @@ on:
         required: false
         type: number
         default: 15
+      cache-key-suffix:
+        description: >-
+          Separates this job's deps/_build/PLT cache from the caller's other gate jobs. Set it
+          when one workflow calls this gate several times with different gate commands (e.g. a
+          static lane that builds the dialyzer PLT beside test lanes that never do): caches are
+          immutable per key and the FIRST job to finish saves, so lanes sharing a key can never
+          persist the slow lane's PLT. Empty (the default) keeps the original shared key.
+        required: false
+        type: string
+        default: ''
     secrets:
       PRIVATE_PACKAGES_TOKEN:
         description: >-
@@ -100,7 +110,9 @@ jobs:
       # cache but an Elixir/OTP bump never restores another toolchain's _build/PLTs.
       # ~/.mix holds dialyxir's CORE PLT (OTP + stdlib), outside _build — without it
       # every run rebuilds the expensive core PLT. priv/plts covers repos that set a
-      # plt_local_path.
+      # plt_local_path. With `cache-key-suffix` set, the suffix goes after `mix-`, and a miss
+      # falls back to the caller's unsuffixed cache (same toolchain) so a lane's first run
+      # starts warm; with it empty both restore lines are the original prefix.
       - name: Cache deps, _build, and PLTs
         uses: actions/cache@v4
         with:
@@ -109,8 +121,9 @@ jobs:
             _build
             ~/.mix
             priv/plts
-          key: ${{ runner.os }}-mix-${{ hashFiles('mise.toml') }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-mix-${{ inputs.cache-key-suffix != '' && format('{0}-', inputs.cache-key-suffix) || '' }}${{ hashFiles('mise.toml') }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
+            ${{ runner.os }}-mix-${{ inputs.cache-key-suffix != '' && format('{0}-', inputs.cache-key-suffix) || '' }}${{ hashFiles('mise.toml') }}-
             ${{ runner.os }}-mix-${{ hashFiles('mise.toml') }}-
 
       - name: Authenticate git for private deps (when PRIVATE_PACKAGES_TOKEN is set)
