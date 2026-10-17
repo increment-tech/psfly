@@ -49,8 +49,10 @@ on:
         default: 15
       runs-on:
         description: >-
-          Runner label for the gate jobs. Default is GitHub-hosted; pass a self-hosted label
-          (or `${{ vars.GATE_RUNNER || 'ubuntu-latest' }}` to flip per repo via a variable).
+          Runner label for the gate jobs. Default is GitHub-hosted; pass a self-hosted label, or an
+          expression on a repo variable (vars.GATE_RUNNER || 'ubuntu-latest') to flip per repo
+          without a commit. No expression syntax here: the parser evaluates it and `vars` is not
+          available in this block, which breaks the whole file.
         required: false
         type: string
         default: ubuntu-latest
