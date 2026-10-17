@@ -122,6 +122,9 @@ jobs:
       # plt_local_path. With `cache-key-suffix` set, the suffix goes after `mix-`, and a miss
       # falls back to the caller's unsuffixed cache (same toolchain) so a lane's first run
       # starts warm; with it empty both restore lines are the original prefix.
+      # Keyed by runner.environment too: a dialyzer PLT records absolute OTP paths and checksums,
+      # so one built on a GitHub-hosted runner is "Old PLT file" on a self-hosted one (and _build
+      # carries the same toolchain fingerprint). Hosted and self-hosted keep separate caches.
       - name: Cache deps, _build, and PLTs
         uses: actions/cache@v4
         with:
@@ -130,10 +133,10 @@ jobs:
             _build
             ~/.mix
             priv/plts
-          key: ${{ runner.os }}-mix-${{ inputs.cache-key-suffix != '' && format('{0}-', inputs.cache-key-suffix) || '' }}${{ hashFiles('mise.toml') }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ inputs.cache-key-suffix != '' && format('{0}-', inputs.cache-key-suffix) || '' }}${{ hashFiles('mise.toml') }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-${{ inputs.cache-key-suffix != '' && format('{0}-', inputs.cache-key-suffix) || '' }}${{ hashFiles('mise.toml') }}-
-            ${{ runner.os }}-mix-${{ hashFiles('mise.toml') }}-
+            ${{ runner.os }}-${{ runner.environment }}-mix-${{ inputs.cache-key-suffix != '' && format('{0}-', inputs.cache-key-suffix) || '' }}${{ hashFiles('mise.toml') }}-
+            ${{ runner.os }}-${{ runner.environment }}-mix-${{ hashFiles('mise.toml') }}-
 
       - name: Authenticate git for private deps (when PRIVATE_PACKAGES_TOKEN is set)
         env:
@@ -191,9 +194,9 @@ jobs:
             _build
             ~/.mix
             priv/plts
-          key: ${{ runner.os }}-mix-dev-${{ hashFiles('mise.toml') }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-mix-dev-${{ hashFiles('mise.toml') }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-mix-dev-${{ hashFiles('mise.toml') }}-
+            ${{ runner.os }}-${{ runner.environment }}-mix-dev-${{ hashFiles('mise.toml') }}-
 
       - name: Authenticate git for private deps (when PRIVATE_PACKAGES_TOKEN is set)
         env:
