@@ -47,6 +47,13 @@ on:
         required: false
         type: number
         default: 15
+      runs-on:
+        description: >-
+          Runner label for the gate jobs. Default is GitHub-hosted; pass a self-hosted label
+          (or `${{ vars.GATE_RUNNER || 'ubuntu-latest' }}` to flip per repo via a variable).
+        required: false
+        type: string
+        default: ubuntu-latest
       cache-key-suffix:
         description: >-
           Separates this job's deps/_build/PLT cache from the caller's other gate jobs. Set it
@@ -74,7 +81,7 @@ permissions:
 jobs:
   gate:
     name: Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
 
     services:
@@ -155,7 +162,7 @@ jobs:
   dialyzer:
     name: Dialyzer
     if: ${{ inputs.parallel-dialyzer }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     steps:
       - uses: actions/checkout@v4

@@ -38,7 +38,8 @@ ordering (`needs:`); the kit owns the runner, toolchain, caching, and the pinnin
   can never drift. Elixir/OTP come from the repo's `mise.toml` via mise — no version
   literal in CI. Inputs: `postgres-db` (required), `postgres-port`, `postgres-image`,
   `gate-command`, `parallel-dialyzer` (a separate dialyzer lane for gate commands that
-  skip it — wall-clock becomes max, not sum), `timeout-minutes`.
+  skip it — wall-clock becomes max, not sum), `timeout-minutes`, `runs-on` (runner label;
+  default `ubuntu-latest`).
 - **`.github/workflows/deploy.yml`** — Fly.io deploy. SHA-pinned `setup-flyctl` with the
   token scoped to the deploy step only, and **no `--strategy` flag** — the strategy lives
   in the fly config's `[deploy]` section, because the CLI flag silently overrides the toml
