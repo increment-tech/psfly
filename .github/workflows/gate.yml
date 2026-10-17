@@ -20,7 +20,11 @@ on:
         required: true
         type: string
       postgres-port:
-        description: Host port to publish Postgres on (what config/test.exs connects to)
+        description: >-
+          Host port to publish Postgres on (what config/test.exs connects to). 0 = a free random
+          port, chosen by Docker; the job exports it as DB_PORT and PGPORT, so have config/test.exs
+          read DB_PORT (falling back to 5432). Use 0 wherever several runner instances share one
+          machine — a fixed port collides as soon as two lanes of the repo run side by side.
         required: false
         type: number
         default: 5432
@@ -94,7 +98,7 @@ jobs:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: ${{ inputs.postgres-db }}
         ports:
-          - ${{ inputs.postgres-port }}:5432
+          - ${{ inputs.postgres-port == 0 && '5432' || format('{0}:5432', inputs.postgres-port) }}
         options: >-
           --health-cmd "pg_isready -U postgres"
           --health-interval 10s
@@ -103,6 +107,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # The host port Postgres actually landed on: the fixed one, or Docker's pick with
+      # postgres-port: 0. Exported for the gate command's config/test.exs (DB_PORT) and psql (PGPORT).
+      - name: Export the database port
+        run: |
+          echo "DB_PORT=${{ job.services.postgres.ports['5432'] }}" >> "$GITHUB_ENV"
+          echo "PGPORT=${{ job.services.postgres.ports['5432'] }}" >> "$GITHUB_ENV"
 
       # Elixir/OTP from the repo's mise.toml — the single pin source CI reads.
       - name: Set up the pinned toolchain (mise)

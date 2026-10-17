@@ -36,7 +36,7 @@ ordering (`needs:`); the kit owns the runner, toolchain, caching, and the pinnin
 - **`.github/workflows/gate.yml`** — the quality gate. The gate *surface* is the consuming
   repo's own gate command (default `bin/precommit`), so CI and the local pre-commit hook
   can never drift. Elixir/OTP come from the repo's `mise.toml` via mise — no version
-  literal in CI. Inputs: `postgres-db` (required), `postgres-port`, `postgres-image`,
+  literal in CI. Inputs: `postgres-db` (required), `postgres-port` (`0` = a free random port, exported as `DB_PORT`/`PGPORT`; have config/test.exs read `DB_PORT` so several runner instances can share one machine), `postgres-image`,
   `gate-command`, `parallel-dialyzer` (a separate dialyzer lane for gate commands that
   skip it — wall-clock becomes max, not sum), `timeout-minutes`, `runs-on` (runner label;
   default `ubuntu-latest`).
